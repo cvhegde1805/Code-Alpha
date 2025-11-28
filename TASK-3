@@ -1,0 +1,168 @@
+"""
+Task 3: Handwritten Character Recognition
+- Trains a CNN (Keras/TensorFlow) on MNIST (default) or on a custom image dataset (numpy arrays / npz).
+- Falls back to an sklearn classifier (SVM) if TensorFlow is not available.
+- Evaluates and saves the trained model.
+Requirements: numpy, pandas, scikit-learn, tensorflow (optional), joblib
+"""
+
+import os
+import argparse
+import numpy as np
+import joblib
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+from sklearn.svm import SVC
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+
+# Try importing TensorFlow / Keras
+try:
+    import tensorflow as tf
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout, BatchNormalization
+    from tensorflow.keras.utils import to_categorical
+    TF_AVAILABLE = True
+except Exception:
+    TF_AVAILABLE = False
+
+def load_mnist():
+    """Load MNIST from Keras datasets and return X (num_samples,28,28), y"""
+    if TF_AVAILABLE:
+        (x_train, y_train), (x_test, y_test) = tf.keras.datasets.mnist.load_data()
+        X = np.vstack([x_train, x_test])
+        y = np.concatenate([y_train, y_test])
+    else:
+        # numpy fallback: try to load from sklearn (not available for MNIST) -> raise helpful error
+        raise RuntimeError("TensorFlow is required to download MNIST automatically. Provide --data_path for a .npz file when tensorflow isn't available.")
+    return X, y
+
+def load_custom_npz(path):
+    """Expect a .npz with arrays 'X' and 'y' (X shape: n,H,W or n,H,W,channels)."""
+    data = np.load(path)
+    if 'X' not in data or 'y' not in data:
+        raise ValueError("Provided .npz must contain arrays 'X' and 'y'.")
+    return data['X'], data['y']
+
+def build_cnn(input_shape, num_classes, dropout=0.25):
+    model = Sequential([
+        Conv2D(32, kernel_size=(3,3), activation='relu', input_shape=input_shape),
+        BatchNormalization(),
+        MaxPooling2D(pool_size=(2,2)),
+        Conv2D(64, kernel_size=(3,3), activation='relu'),
+        BatchNormalization(),
+        MaxPooling2D(pool_size=(2,2)),
+        Flatten(),
+        Dense(128, activation='relu'),
+        Dropout(dropout),
+        Dense(num_classes, activation='softmax')
+    ])
+    model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+    return model
+
+def main(args):
+    # Load data
+    if args.data_path:
+        X, y = load_custom_npz(args.data_path)
+    else:
+        X, y = load_mnist()
+
+    # Ensure data has correct dims: (n, H, W) or (n, H, W, C)
+    if X.ndim == 3:
+        X = X[..., np.newaxis]  # add channel dim
+    n_samples, H, W, C = X.shape
+    print(f"Loaded data: {n_samples} samples, image size {H}x{W}, channels={C}, classes={np.unique(y)}")
+
+    # If using TF / CNN
+    if args.model == 'cnn' and TF_AVAILABLE:
+        # Normalize to [0,1]
+        X = X.astype('float32') / 255.0
+        # train/test split
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=args.test_size, stratify=y, random_state=42)
+        num_classes = int(np.unique(y).size)
+        y_train_cat = to_categorical(y_train, num_classes)
+        y_test_cat = to_categorical(y_test, num_classes)
+
+        model = build_cnn(input_shape=(H,W,C), num_classes=num_classes, dropout=args.dropout)
+        model.summary()
+
+        # Callbacks: ModelCheckpoint
+        os.makedirs(args.output_dir, exist_ok=True)
+        checkpoint_path = os.path.join(args.output_dir, 'best_cnn.h5')
+        callbacks = [
+            tf.keras.callbacks.ModelCheckpoint(checkpoint_path, save_best_only=True, monitor='val_accuracy', mode='max'),
+            tf.keras.callbacks.EarlyStopping(monitor='val_accuracy', patience=5, restore_best_weights=True)
+        ]
+
+        history = model.fit(
+            X_train, y_train_cat,
+            validation_split=args.val_split,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            callbacks=callbacks,
+            verbose=2
+        )
+
+        # Evaluate
+        eval_results = model.evaluate(X_test, y_test_cat, verbose=0)
+        print(f"Test loss: {eval_results[0]:.4f}, Test accuracy: {eval_results[1]:.4f}")
+
+        y_pred_probs = model.predict(X_test)
+        y_pred = np.argmax(y_pred_probs, axis=1)
+
+        print("Classification report:\n", classification_report(y_test, y_pred))
+        print("Confusion matrix:\n", confusion_matrix(y_test, y_pred))
+
+        # Save final model (best already saved by checkpoint)
+        final_model_path = os.path.join(args.output_dir, 'cnn_handwritten_model.h5')
+        model.save(final_model_path)
+        print("Saved CNN model to", final_model_path)
+
+        # Save training history (optional)
+        history_path = os.path.join(args.output_dir, 'training_history.joblib')
+        joblib.dump(history.history, history_path)
+        print("Saved training history to", history_path)
+
+    else:
+        # Use sklearn fallback (SVM) on flattened pixels
+        if args.model == 'cnn' and not TF_AVAILABLE:
+            print("TensorFlow not available — falling back to sklearn SVM on flattened pixels.")
+        # flatten images
+        X_flat = X.reshape((X.shape[0], -1)).astype('float32')
+        # Scale
+        # Use train_test_split with stratify
+        X_train, X_test, y_train, y_test = train_test_split(X_flat, y, test_size=args.test_size, stratify=y, random_state=42)
+
+        pipeline = Pipeline([
+            ('scaler', StandardScaler()),
+            ('svc', SVC(kernel='rbf', probability=True))
+        ])
+        print("Training SVM pipeline (this may take a while)...")
+        pipeline.fit(X_train, y_train)
+        y_pred = pipeline.predict(X_test)
+        y_proba = pipeline.predict_proba(X_test)[:,1] if hasattr(pipeline, 'predict_proba') else None
+
+        acc = accuracy_score(y_test, y_pred)
+        print(f"Test accuracy: {acc:.4f}")
+        print("Classification report:\n", classification_report(y_test, y_pred))
+        print("Confusion matrix:\n", confusion_matrix(y_test, y_pred))
+
+        os.makedirs(args.output_dir, exist_ok=True)
+        model_path = os.path.join(args.output_dir, 'svm_handwritten_model.joblib')
+        joblib.dump(pipeline, model_path)
+        print("Saved sklearn model to", model_path)
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Handwritten Character Recognition (Task 3)")
+    parser.add_argument('--data_path', type=str, default=None,
+                        help="Optional path to .npz file containing 'X' and 'y'. If omitted, MNIST is used (requires tensorflow).")
+    parser.add_argument('--output_dir', type=str, default='./models_task3', help='Where to save model and artifacts')
+    parser.add_argument('--model', type=str, default='cnn', choices=['cnn','svm'],
+                        help='Model to use: cnn (Keras) or svm (sklearn fallback)')
+    parser.add_argument('--epochs', type=int, default=20)
+    parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--val_split', type=float, default=0.1)
+    parser.add_argument('--dropout', type=float, default=0.25)
+    parser.add_argument('--test_size', type=float, default=0.2)
+    args = parser.parse_args()
+    main(args)
