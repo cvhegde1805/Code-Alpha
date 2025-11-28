@@ -1,0 +1,115 @@
+"""
+Task 1: Credit Scoring Model
+- Expects a CSV dataset (path configured below) with columns such as:
+  'age', 'income', 'loan_amount', 'credit_history', 'num_of_loans', 'payment_history', ... and a target column 'default' (0/1)
+- Produces: trained RandomForestClassifier, performance metrics, feature importances, saved model (joblib)
+Requirements: pandas, numpy, scikit-learn, category_encoders, joblib
+"""
+
+import os
+import argparse
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix
+import joblib
+
+def load_data(path):
+    df = pd.read_csv(path)
+    return df
+
+def build_pipeline(numeric_features, categorical_features):
+    numeric_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler())
+    ])
+    categorical_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='most_frequent')),
+        ('onehot', OneHotEncoder(handle_unknown='ignore', sparse=False))
+    ])
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', numeric_transformer, numeric_features),
+            ('cat', categorical_transformer, categorical_features)
+        ])
+    clf = Pipeline(steps=[
+        ('preprocessor', preprocessor),
+        ('classifier', RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1))
+    ])
+    return clf
+
+def main(args):
+    # Load
+    df = load_data(args.data)
+    if args.target not in df.columns:
+        raise ValueError(f"Target column '{args.target}' not found in dataset columns: {df.columns.tolist()}")
+
+    # Basic feature selection: auto-detect numeric and categorical (simple heuristic)
+    y = df[args.target].astype(int)
+    X = df.drop(columns=[args.target])
+
+    numeric_features = X.select_dtypes(include=['int64', 'float64']).columns.tolist()
+    categorical_features = X.select_dtypes(include=['object', 'category', 'bool']).columns.tolist()
+
+    print("Numeric features:", numeric_features)
+    print("Categorical features:", categorical_features)
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=args.test_size, stratify=y, random_state=42)
+
+    model = build_pipeline(numeric_features, categorical_features)
+
+    # Optional small grid search for a hyperparameter
+    param_grid = {
+        'classifier__n_estimators': [100, 200],
+        'classifier__max_depth': [None, 10, 20],
+        'classifier__class_weight': [None, 'balanced']
+    }
+    search = GridSearchCV(model, param_grid, cv=3, scoring='roc_auc', n_jobs=-1, verbose=1)
+    search.fit(X_train, y_train)
+    best = search.best_estimator_
+    print("Best params:", search.best_params_)
+
+    y_pred = best.predict(X_test)
+    y_proba = best.predict_proba(X_test)[:,1]
+
+    print("Classification report:\n", classification_report(y_test, y_pred))
+    print("ROC AUC:", roc_auc_score(y_test, y_proba))
+    print("Confusion matrix:\n", confusion_matrix(y_test, y_pred))
+
+    # Feature importances: need to get feature names after preprocessing
+    # Get preprocessor and classifier
+    preprocessor = best.named_steps['preprocessor']
+    classifier = best.named_steps['classifier']
+    # Build feature names
+    num_feats = numeric_features
+    cat_feats = []
+    if categorical_features:
+        # OneHotEncoder inside pipeline: extract categories
+        ohe = preprocessor.named_transformers_['cat'].named_steps['onehot']
+        cat_cols = ohe.get_feature_names_out(categorical_features).tolist()
+        cat_feats = cat_cols
+    feature_names = num_feats + cat_feats
+
+    importances = classifier.feature_importances_
+    fi = pd.Series(importances, index=feature_names).sort_values(ascending=False)
+    print("Top feature importances:\n", fi.head(20))
+
+    # Save model
+    os.makedirs(args.output_dir, exist_ok=True)
+    model_path = os.path.join(args.output_dir, 'credit_scoring_model.joblib')
+    joblib.dump(best, model_path)
+    print("Saved model to", model_path)
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Credit Scoring Task")
+    parser.add_argument('--data', type=str, required=True, help='Path to CSV dataset')
+    parser.add_argument('--target', type=str, default='default', help='Target column name (0/1)')
+    parser.add_argument('--output_dir', type=str, default='./models_task1', help='Where to save model')
+    parser.add_argument('--test_size', type=float, default=0.2)
+    args = parser.parse_args()
+    main(args)
