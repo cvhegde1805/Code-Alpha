@@ -1,0 +1,118 @@
+"""
+Task 4: Disease Prediction (example with tabular medical data)
+- Expects a CSV dataset (path configured below) with features like:
+  'age','sex','cholesterol','blood_pressure','glucose','symptom_x',... and target column 'disease' (0/1)
+- Provides training of XGBoost or RandomForest, evaluation, SHAP explanation code (optional)
+Requirements: pandas, numpy, scikit-learn, xgboost (optional), joblib, shap (optional)
+"""
+
+import os
+import argparse
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix
+import joblib
+
+try:
+    import xgboost as xgb
+    XGBOOST_AVAILABLE = True
+except Exception:
+    XGBOOST_AVAILABLE = False
+
+def load_data(path):
+    df = pd.read_csv(path)
+    return df
+
+def build_model(choice='xgb', **kwargs):
+    if choice == 'xgb' and XGBOOST_AVAILABLE:
+        model = xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss', n_jobs=-1, **kwargs)
+    else:
+        model = RandomForestClassifier(n_jobs=-1, **kwargs)
+    return model
+
+def main(args):
+    df = load_data(args.data)
+    if args.target not in df.columns:
+        raise ValueError(f"Target column '{args.target}' not found in dataset columns: {df.columns.tolist()}")
+
+    y = df[args.target].astype(int)
+    X = df.drop(columns=[args.target])
+
+    numeric_features = X.select_dtypes(include=['int64','float64']).columns.tolist()
+    categorical_features = X.select_dtypes(include=['object','category','bool']).columns.tolist()
+
+    print("Numeric features:", numeric_features)
+    print("Categorical features:", categorical_features)
+
+    numeric_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler())
+    ])
+    categorical_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='most_frequent')),
+        ('onehot', OneHotEncoder(handle_unknown='ignore', sparse=False))
+    ])
+    preprocessor = ColumnTransformer(transformers=[
+        ('num', numeric_transformer, numeric_features),
+        ('cat', categorical_transformer, categorical_features)
+    ])
+
+    model = build_model(choice=args.model, n_estimators=200 if args.model!='xgb' else None, max_depth=args.max_depth)
+
+    pipeline = Pipeline(steps=[
+        ('preprocessor', preprocessor),
+        ('classifier', model)
+    ])
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=args.test_size, stratify=y, random_state=42)
+
+    pipeline.fit(X_train, y_train)
+    y_pred = pipeline.predict(X_test)
+    if hasattr(pipeline.named_steps['classifier'], "predict_proba"):
+        y_proba = pipeline.predict_proba(X_test)[:,1]
+        auc = roc_auc_score(y_test, y_proba)
+    else:
+        auc = None
+
+    print("Classification report:\n", classification_report(y_test, y_pred))
+    if auc is not None:
+        print("ROC AUC:", auc)
+    print("Confusion matrix:\n", confusion_matrix(y_test, y_pred))
+
+    # Feature importances if available
+    clf = pipeline.named_steps['classifier']
+    if hasattr(clf, 'feature_importances_'):
+        # Need to get feature names after preprocess
+        pre = pipeline.named_steps['preprocessor']
+        num_feats = numeric_features
+        cat_feats = []
+        if categorical_features:
+            ohe = pre.named_transformers_['cat'].named_steps['onehot']
+            cat_feats = ohe.get_feature_names_out(categorical_features).tolist()
+        feat_names = num_feats + cat_feats
+        importances = clf.feature_importances_
+        fi = pd.Series(importances, index=feat_names).sort_values(ascending=False)
+        print("Top feature importances:\n", fi.head(20))
+
+    # Save model
+    os.makedirs(args.output_dir, exist_ok=True)
+    model_path = os.path.join(args.output_dir, 'disease_prediction_model.joblib')
+    joblib.dump(pipeline, model_path)
+    print("Saved model to", model_path)
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Disease Prediction Task")
+    parser.add_argument('--data', type=str, required=True, help='Path to CSV dataset')
+    parser.add_argument('--target', type=str, default='disease', help='Target column name (0/1)')
+    parser.add_argument('--output_dir', type=str, default='./models_task4', help='Where to save model')
+    parser.add_argument('--model', type=str, default='xgb', choices=['xgb','rf'], help='Model to use (xgb or rf)')
+    parser.add_argument('--max_depth', type=int, default=6)
+    parser.add_argument('--test_size', type=float, default=0.2)
+    args = parser.parse_args()
+    main(args)
